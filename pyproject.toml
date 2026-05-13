@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kd-mcp"
+version = "0.1.0"
+description = "MCP server wrapping kd.exe for Windows kernel debugging over KDNET."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Prelude Research, Inc." }, { name = "tyler", email = "tyler@preludesecurity.com" }]
+keywords = ["mcp", "windows", "kernel", "debugging", "kd", "windbg", "kdnet"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/originsec/kd-mcp"
+Repository = "https://github.com/originsec/kd-mcp"
+Issues = "https://github.com/originsec/kd-mcp/issues"
+
+[project.scripts]
+kd-mcp = "kd_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kd_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/kd_mcp",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+]
