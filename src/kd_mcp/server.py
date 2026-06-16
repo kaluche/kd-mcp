@@ -40,6 +40,14 @@ _ANY_CONNECTED_RE = re.compile(
     r"(Kernel Debugger connection established|Connected to target .+ on port \d+)",
     re.IGNORECASE,
 )
+# kd.exe init failures that retrying cannot fix -- bail out immediately instead of
+# respawning kd.exe in a tight loop. The most common case is the KDNET port already
+# being held by another debugger (windbg.exe/kd.exe), which never clears on its own.
+_FATAL_INIT_RE = re.compile(
+    r"already in use|Debuggee initialization failed|"
+    r"Kernel debugger failed initialization|HRESULT 0x80004005",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # KdProcess -- subprocess wrapper with expect-style I/O
@@ -151,6 +159,7 @@ class KdProcess:
 
 class _State:
     kd: Optional[KdProcess] = None
+    last_connect_string: str = ""
 
 STATE = _State()
 mcp = FastMCP("kd")
@@ -254,6 +263,7 @@ def kernel_attach(
             STATE.kd.send_break()
             out += STATE.kd.expect(_PROMPT_RE, timeout=60)
             ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
+            STATE.last_connect_string = connect_string
             return {
                 "status": "connected",
                 "attempts": attempt,
@@ -265,6 +275,19 @@ def kernel_attach(
             last_error = str(exc)
             STATE.kd.kill()
             STATE.kd = None
+            if _FATAL_INIT_RE.search(last_error):
+                # Permanent failure -- respawning will only spin and can destabilize
+                # the server. Stop now with an actionable message.
+                return {
+                    "status": "error",
+                    "attempts": attempt,
+                    "message": (
+                        "kd.exe could not initialize, and retrying will not help. "
+                        "Most often the KDNET port is already in use by another "
+                        "debugger (close any windbg.exe/kd.exe holding it), or the "
+                        "connection key is wrong.\n" + last_error[-600:]
+                    ),
+                }
             remaining = deadline - time.monotonic()
             if remaining <= 1:
                 break
@@ -308,6 +331,40 @@ def detach() -> dict:
         STATE.kd.kill()
     STATE.kd = None
     return {"status": "disconnected"}
+
+
+@mcp.tool()
+def reset(connect_string: str = "", reconnect: bool = True, timeout: int = 90) -> dict:
+    """
+    Force-kill the current kd.exe and (optionally) reconnect.
+
+    Use this when the debugger is wedged or unresponsive (commands time out and
+    break_in does not recover it). Unlike detach, this does not try a graceful
+    "q" first -- it terminates kd.exe immediately, then re-attaches.
+
+    Args:
+        connect_string: KDNET string to reconnect with. If omitted, the last
+                        successful connect_string is reused.
+        reconnect:      Re-attach after killing (default True). Set False to just
+                        tear the session down.
+        timeout:        Seconds to keep trying for the reconnection (default 90).
+
+    Returns: kernel_attach's result when reconnecting, else {status}.
+    """
+    if STATE.kd:
+        STATE.kd.kill()
+    STATE.kd = None
+
+    if not reconnect:
+        return {"status": "killed"}
+
+    cs = connect_string or STATE.last_connect_string
+    if not cs:
+        return {
+            "status": "killed",
+            "message": "No connect_string to reconnect with; pass one or call kernel_attach.",
+        }
+    return kernel_attach(connect_string=cs, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +654,38 @@ def reload_symbols(module: str = "") -> dict:
 
 def main() -> None:
     global KD_EXE
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="MCP server wrapping kd.exe for Windows kernel debugging over KDNET",
+    )
+    parser.add_argument(
+        "--kd-path",
+        type=str,
+        help="Path to kd.exe (overrides the KD_EXE environment variable)",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="Transport protocol to use (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind the HTTP server to (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind the HTTP server to (default: 8000)",
+    )
+    args = parser.parse_args()
+
+    if args.kd_path:
+        KD_EXE = args.kd_path
+
     if not os.path.exists(KD_EXE):
         import shutil
         found = shutil.which("kd.exe") or shutil.which("kd")
@@ -604,11 +693,27 @@ def main() -> None:
             KD_EXE = found
         else:
             print(f"ERROR: kd.exe not found at {KD_EXE} and not in PATH.", file=sys.stderr)
-            print("Set KD_EXE environment variable to point to kd.exe.", file=sys.stderr)
+            print("Set the KD_EXE environment variable or pass --kd-path to point to kd.exe.", file=sys.stderr)
             sys.exit(1)
 
-    print("kd MCP server starting (stdio)...", file=sys.stderr)
-    mcp.run()
+    if args.transport == "streamable-http":
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        # The HTTP transport is unauthenticated and meant for a trusted network
+        # (see README). FastMCP's DNS-rebinding protection otherwise rejects any
+        # Host header that is not localhost, which blocks reaching the server by
+        # its LAN IP. Disable it so the bind address is actually usable.
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+        endpoint = f"http://{args.host}:{args.port}{mcp.settings.streamable_http_path}"
+        print(f"kd MCP server starting (streamable-http) on {endpoint}", file=sys.stderr)
+        mcp.run(transport="streamable-http")
+    else:
+        print("kd MCP server starting (stdio)...", file=sys.stderr)
+        mcp.run()
 
 
 if __name__ == "__main__":

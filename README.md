@@ -94,6 +94,33 @@ python -m kd_mcp
 
 ---
 
+## Remote / HTTP transport
+
+By default the server speaks MCP over stdio, which assumes your MCP client runs on the
+same Windows machine as `kd.exe`. To drive it from another machine (for example, Claude
+Code running on a Linux box), start the server with the streamable-http transport on the
+debug host and connect to it over the network:
+
+```powershell
+# On the debug host (the machine running kd.exe):
+python -m kd_mcp --transport streamable-http --host 0.0.0.0 --port 8001
+```
+
+Then register it from the client machine:
+
+```bash
+claude mcp add --transport http kd http://<debug-host-ip>:8001/mcp
+```
+
+`kd.exe` still runs on the debug host; only the MCP traffic crosses the network. The
+KDNET connection (`kernel_attach`) is between the debug host and the target kernel as
+usual.
+
+> The HTTP transport has no authentication. Bind it to `0.0.0.0` only on a trusted,
+> isolated network such as a lab debug subnet.
+
+---
+
 ## Development install
 
 ```powershell
