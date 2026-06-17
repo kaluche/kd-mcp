@@ -9,6 +9,8 @@ Environment variables:
     KD_EXE  Path to kd.exe (default: WDK x64 location)
 """
 
+import atexit
+import functools
 import os
 import re
 import signal
@@ -18,6 +20,7 @@ import threading
 import time
 from typing import Optional
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
@@ -50,6 +53,97 @@ _FATAL_INIT_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# Windows Job Object -- guarantees kd.exe children die with this server.
+#
+# kd.exe is spawned as a child process. On Windows, killing or crashing the
+# parent (or `taskkill`-ing it) does NOT kill the child, so orphaned kd.exe
+# processes keep holding the KDNET UDP port -- after which no new kd.exe can
+# bind it ("Failed to initialize IPv4 socket", HRESULT 0x80004005) and the only
+# observed recovery was a manual taskkill / VM restart. Assigning every kd.exe
+# to a job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes Windows terminate them
+# when our last handle to the job closes -- which happens automatically when
+# this process exits for ANY reason, including a hard taskkill.
+# ---------------------------------------------------------------------------
+
+_JOB = None  # opaque job handle (HANDLE) on Windows; None elsewhere
+
+
+def _ensure_job():
+    """Create (once) a kill-on-close job object. Returns the handle or None."""
+    global _JOB
+    if _JOB is not None or os.name != "nt":
+        return _JOB
+    import ctypes
+    from ctypes import wintypes
+
+    class _BASIC(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _EXT(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC),
+            ("IoInfo", _IO),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JobObjectExtendedLimitInformation = 9
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    hjob = k32.CreateJobObjectW(None, None)
+    if not hjob:
+        return None
+    info = _EXT()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(
+        hjob, JobObjectExtendedLimitInformation,
+        ctypes.byref(info), ctypes.sizeof(info),
+    ):
+        k32.CloseHandle(hjob)
+        return None
+    _JOB = hjob
+    return _JOB
+
+
+def _assign_to_job(pid: int) -> None:
+    """Best-effort: put a kd.exe pid in the kill-on-close job."""
+    if os.name != "nt":
+        return
+    hjob = _ensure_job()
+    if not hjob:
+        return
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    PROCESS_SET_QUOTA = 0x0100
+    PROCESS_TERMINATE = 0x0001
+    hproc = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+    if not hproc:
+        return
+    try:
+        k32.AssignProcessToJobObject(hjob, hproc)
+    finally:
+        k32.CloseHandle(hproc)
+
+
+# ---------------------------------------------------------------------------
 # KdProcess -- subprocess wrapper with expect-style I/O
 # ---------------------------------------------------------------------------
 
@@ -69,6 +163,9 @@ class KdProcess:
             bufsize=-1,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+        # Tie kd.exe's lifetime to ours so it can't be orphaned holding the
+        # KDNET port (see _ensure_job above).
+        _assign_to_job(self.proc.pid)
         self._buf = ""
         self._lock = threading.Lock()
         self._ev = threading.Event()
@@ -164,6 +261,39 @@ class _State:
 STATE = _State()
 mcp = FastMCP("kd")
 
+# Serializes access to kd.exe's stdin/stdout. Every tool now runs in a worker
+# thread (see _offload), so without this two concurrent commands would
+# interleave writes and cannibalize each other's output from the shared buffer.
+# Reentrant because reset() calls kernel_attach() on the same thread.
+_LOCK = threading.RLock()
+
+
+def _offload(fn):
+    """
+    Register a synchronous tool body as an MCP tool that runs in a worker
+    thread instead of on the asyncio event loop.
+
+    The MCP SDK calls synchronous tools directly on the event loop, so a single
+    blocking kd command (go can wait 120s, kernel_attach 90s, or any command
+    that hangs while the target is running) would freeze the ENTIRE server --
+    no other request, including break_in, could run until it returned. Running
+    the body in a thread keeps the loop free and lets break_in interrupt an
+    in-flight go.
+    """
+    @mcp.tool(name=fn.__name__, description=(fn.__doc__ or "").strip())
+    @functools.wraps(fn)
+    async def wrapper(**kwargs):
+        return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+
+    return wrapper
+
+
+@atexit.register
+def _cleanup() -> None:
+    """Make sure kd.exe doesn't outlive us even on a graceful exit."""
+    if STATE.kd is not None:
+        STATE.kd.kill()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -178,9 +308,10 @@ def _require() -> KdProcess:
 def _cmd(cmd: str, timeout: float = 20.0) -> str:
     """Send a command, wait for the next kd> prompt, return output (prompt stripped)."""
     kd = _require()
-    kd.drain()
-    kd.sendline(cmd)
-    raw = kd.expect(_PROMPT_RE, timeout=timeout)
+    with _LOCK:
+        kd.drain()
+        kd.sendline(cmd)
+        raw = kd.expect(_PROMPT_RE, timeout=timeout)
     # Strip the trailing prompt and leading echo of our command.
     out = _PROMPT_RE.sub("", raw).strip()
     # Remove first line if it looks like the command echo.
@@ -194,7 +325,7 @@ def _cmd(cmd: str, timeout: float = 20.0) -> str:
 # MCP tools -- session
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_offload
 def kernel_attach(
     connect_string: str,
     reset_vm: str = "",
@@ -215,100 +346,105 @@ def kernel_attach(
 
     Returns: {status, kernel_version, attempts, output} or {status, message}
     """
-    # Kill any previous session.
-    if STATE.kd and STATE.kd.is_alive():
-        try:
-            STATE.kd.sendline("q")
-            time.sleep(0.4)
-        except Exception:
-            pass
-        STATE.kd.kill()
-    STATE.kd = None
-
-    args = [KD_EXE, "-k", connect_string]
-
-    try:
-        STATE.kd = KdProcess(args)
-    except OSError as exc:
-        return {"status": "error", "message": f"Failed to launch kd.exe: {exc}"}
-
-    if reset_vm:
-        subprocess.Popen(
-            [
-                "powershell", "-NoProfile", "-Command",
-                f"Start-Sleep -Seconds 2; Restart-VM -Name '{reset_vm}' -Force",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    deadline = time.monotonic() + timeout
-    attempt = 0
-    last_error = "Timeout waiting for KDNET connection"
-
-    while True:
-        attempt += 1
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            # Phase 1: wait for TCP connect OR full KD handshake.
-            # On a running system kd.exe fires "Connected to target" first;
-            # the kernel won't complete the KD handshake until we break in.
-            # On a boot-break system the full handshake arrives on its own.
-            out = STATE.kd.expect(_ANY_CONNECTED_RE, timeout=remaining)
-            # Phase 2: send break always.  Harmless if the kernel is already
-            # halted (boot break); required to trigger the KD handshake on a
-            # running system.
-            STATE.kd.send_break()
-            out += STATE.kd.expect(_PROMPT_RE, timeout=60)
-            ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
-            STATE.last_connect_string = connect_string
-            return {
-                "status": "connected",
-                "attempts": attempt,
-                "kernel_version": ver.group(0) if ver else "unknown",
-                "output": out[-600:].strip(),
-            }
-        except RuntimeError as exc:
-            # kd.exe exited (connection refused, wrong key, etc.) -- respawn and retry
-            last_error = str(exc)
-            STATE.kd.kill()
-            STATE.kd = None
-            if _FATAL_INIT_RE.search(last_error):
-                # Permanent failure -- respawning will only spin and can destabilize
-                # the server. Stop now with an actionable message.
-                return {
-                    "status": "error",
-                    "attempts": attempt,
-                    "message": (
-                        "kd.exe could not initialize, and retrying will not help. "
-                        "Most often the KDNET port is already in use by another "
-                        "debugger (close any windbg.exe/kd.exe holding it), or the "
-                        "connection key is wrong.\n" + last_error[-600:]
-                    ),
-                }
-            remaining = deadline - time.monotonic()
-            if remaining <= 1:
-                break
-            time.sleep(1)
+    with _LOCK:
+        # Kill any previous session. Clear breakpoints first (so no int 3 is
+        # left in user code -- see detach), then qd (quit + detach) so the
+        # previous target is left running rather than stranded halted.
+        if STATE.kd and STATE.kd.is_alive():
             try:
-                STATE.kd = KdProcess(args)
-            except OSError as oserr:
+                STATE.kd.sendline("bc *")
+                time.sleep(0.2)
+                STATE.kd.sendline("qd")
+                time.sleep(0.4)
+            except Exception:
+                pass
+            STATE.kd.kill()
+        STATE.kd = None
+
+        args = [KD_EXE, "-k", connect_string]
+
+        try:
+            STATE.kd = KdProcess(args)
+        except OSError as exc:
+            return {"status": "error", "message": f"Failed to launch kd.exe: {exc}"}
+
+        if reset_vm:
+            subprocess.Popen(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"Start-Sleep -Seconds 2; Restart-VM -Name '{reset_vm}' -Force",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        last_error = "Timeout waiting for KDNET connection"
+
+        while True:
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                # Phase 1: wait for TCP connect OR full KD handshake.
+                # On a running system kd.exe fires "Connected to target" first;
+                # the kernel won't complete the KD handshake until we break in.
+                # On a boot-break system the full handshake arrives on its own.
+                out = STATE.kd.expect(_ANY_CONNECTED_RE, timeout=remaining)
+                # Phase 2: send break always.  Harmless if the kernel is already
+                # halted (boot break); required to trigger the KD handshake on a
+                # running system.
+                STATE.kd.send_break()
+                out += STATE.kd.expect(_PROMPT_RE, timeout=60)
+                ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
+                STATE.last_connect_string = connect_string
+                return {
+                    "status": "connected",
+                    "attempts": attempt,
+                    "kernel_version": ver.group(0) if ver else "unknown",
+                    "output": out[-600:].strip(),
+                }
+            except RuntimeError as exc:
+                # kd.exe exited (connection refused, wrong key, etc.) -- respawn and retry
+                last_error = str(exc)
+                STATE.kd.kill()
                 STATE.kd = None
-                return {"status": "error", "message": f"Failed to launch kd.exe: {oserr}"}
-        except TimeoutError as exc:
-            # Full timeout elapsed in a single attempt -- no point retrying
-            last_error = str(exc)
+                if _FATAL_INIT_RE.search(last_error):
+                    # Permanent failure -- respawning will only spin and can destabilize
+                    # the server. Stop now with an actionable message.
+                    return {
+                        "status": "error",
+                        "attempts": attempt,
+                        "message": (
+                            "kd.exe could not initialize, and retrying will not help. "
+                            "Most often the KDNET port is already in use by another "
+                            "debugger (close any windbg.exe/kd.exe holding it), or the "
+                            "connection key is wrong.\n" + last_error[-600:]
+                        ),
+                    }
+                remaining = deadline - time.monotonic()
+                if remaining <= 1:
+                    break
+                time.sleep(1)
+                try:
+                    STATE.kd = KdProcess(args)
+                except OSError as oserr:
+                    STATE.kd = None
+                    return {"status": "error", "message": f"Failed to launch kd.exe: {oserr}"}
+            except TimeoutError as exc:
+                # Full timeout elapsed in a single attempt -- no point retrying
+                last_error = str(exc)
+                STATE.kd.kill()
+                STATE.kd = None
+                break
+
+        # Ensure STATE is clean so subsequent calls get a clear "not connected" error
+        if STATE.kd is not None:
             STATE.kd.kill()
             STATE.kd = None
-            break
-
-    # Ensure STATE is clean so subsequent calls get a clear "not connected" error
-    if STATE.kd is not None:
-        STATE.kd.kill()
-        STATE.kd = None
-    return {"status": "error", "attempts": attempt, "message": last_error}
+        return {"status": "error", "attempts": attempt, "message": last_error}
 
 
 @mcp.tool()
@@ -319,21 +455,36 @@ def status() -> dict:
     return {"connected": True, "pid": STATE.kd.proc.pid}
 
 
-@mcp.tool()
+@_offload
 def detach() -> dict:
-    """Quit kd.exe and end the debugging session."""
-    if STATE.kd:
-        try:
-            STATE.kd.sendline("q")
-            time.sleep(0.4)
-        except Exception:
-            pass
-        STATE.kd.kill()
-    STATE.kd = None
+    """
+    End the debugging session, leaving the target RUNNING.
+
+    Uses 'qd' (quit and detach) rather than bare 'q'. A plain 'q' ends the kd
+    session but leaves the target halted at its current break -- frozen, with no
+    debugger attached -- which then needs a VM reset to recover. 'qd' detaches
+    so the kernel keeps running.
+    """
+    with _LOCK:
+        if STATE.kd:
+            try:
+                # Clear breakpoints first. A software breakpoint is an int 3
+                # written into the target's code; if we leave one in a user
+                # process (especially a critical one like lsass) and detach,
+                # the process hits it with no debugger attached -> unhandled
+                # exception -> CRITICAL_PROCESS_DIED bugcheck -> VM needs a reset.
+                STATE.kd.sendline("bc *")
+                time.sleep(0.2)
+                STATE.kd.sendline("qd")
+                time.sleep(0.4)
+            except Exception:
+                pass
+            STATE.kd.kill()
+        STATE.kd = None
     return {"status": "disconnected"}
 
 
-@mcp.tool()
+@_offload
 def reset(connect_string: str = "", reconnect: bool = True, timeout: int = 90) -> dict:
     """
     Force-kill the current kd.exe and (optionally) reconnect.
@@ -351,9 +502,23 @@ def reset(connect_string: str = "", reconnect: bool = True, timeout: int = 90) -
 
     Returns: kernel_attach's result when reconnecting, else {status}.
     """
-    if STATE.kd:
-        STATE.kd.kill()
+    # Deliberately do NOT take _LOCK before killing: a wedged command may be
+    # holding it inside expect(), and the whole point of reset is to recover
+    # from that. Dropping STATE.kd and killing the process makes that command's
+    # expect() see a dead process and raise, which releases the lock; the
+    # reconnect below (kernel_attach) then acquires it normally.
+    old = STATE.kd
     STATE.kd = None
+    if old:
+        try:
+            # Best-effort breakpoint clear so a hard reset doesn't strand an
+            # int 3 in user code (e.g. lsass -> CRITICAL_PROCESS_DIED). No-ops
+            # if kd is truly wedged; we kill regardless.
+            old.sendline("bc *")
+            time.sleep(0.2)
+        except Exception:
+            pass
+        old.kill()
 
     if not reconnect:
         return {"status": "killed"}
@@ -364,14 +529,16 @@ def reset(connect_string: str = "", reconnect: bool = True, timeout: int = 90) -
             "status": "killed",
             "message": "No connect_string to reconnect with; pass one or call kernel_attach.",
         }
-    return kernel_attach(connect_string=cs, timeout=timeout)
+    # kernel_attach is now an async MCP wrapper; call the underlying sync
+    # implementation (set by functools.wraps) so we stay synchronous.
+    return kernel_attach.__wrapped__(connect_string=cs, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
 # MCP tools -- execution control
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_offload
 def go(timeout: int = 120) -> dict:
     """
     Resume kernel execution (g) and wait for the next break event.
@@ -379,21 +546,28 @@ def go(timeout: int = 120) -> dict:
     Args:
         timeout: Seconds to wait for the next break (default 120).
 
-    Returns: {status, output}
+    Returns: {status, output}. status is "break" if the target stopped,
+    "running" if it's still going after `timeout` (no breakpoint hit -- not an
+    error), or "error".
     """
     kd = _require()
-    kd.drain()
-    kd.sendline("g")
-    try:
-        out = kd.expect(_PROMPT_RE, timeout=float(timeout))
-        return {"status": "break", "output": out.strip()}
-    except TimeoutError as exc:
-        return {"status": "timeout", "error": str(exc)}
-    except RuntimeError as exc:
-        return {"status": "error", "error": str(exc)}
+    with _LOCK:
+        kd.drain()
+        kd.sendline("g")
+        try:
+            out = kd.expect(_PROMPT_RE, timeout=float(timeout))
+            return {"status": "break", "output": out.strip()}
+        except TimeoutError:
+            # No prompt within the window == the target is still running. This
+            # is the normal outcome when no breakpoint is set; break_in (which
+            # does not need the lock) can interrupt it.
+            return {"status": "running",
+                    "message": f"Target still running after {timeout}s."}
+        except RuntimeError as exc:
+            return {"status": "error", "error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def break_in(timeout: int = 15) -> dict:
     """
     Force a break into the running kernel (Ctrl+Break / NMI over KDNET).
@@ -404,16 +578,26 @@ def break_in(timeout: int = 15) -> dict:
     Returns: {status, output}
     """
     kd = _require()
-    kd.drain()
+    # Fire the NMI without taking the lock so we can interrupt an in-flight go.
     kd.send_break()
+    # If a command (e.g. go) is currently holding the pipe, IT will consume the
+    # prompt the break produces and return -- so we just report the signal was
+    # sent. If nothing is in flight, grab the lock and collect the prompt here.
+    if not _LOCK.acquire(blocking=False):
+        return {"status": "sent",
+                "message": "Break signal sent; an in-flight command will return it."}
     try:
         out = kd.expect(_PROMPT_RE, timeout=float(timeout))
         return {"status": "break", "output": out.strip()}
     except TimeoutError:
         return {"status": "sent", "message": "Break signal sent; no prompt yet."}
+    except RuntimeError as exc:
+        return {"status": "error", "error": str(exc)}
+    finally:
+        _LOCK.release()
 
 
-@mcp.tool()
+@_offload
 def step_into() -> dict:
     """Single-step into next instruction (t)."""
     try:
@@ -422,7 +606,7 @@ def step_into() -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def step_over() -> dict:
     """Step over next instruction (p)."""
     try:
@@ -435,7 +619,7 @@ def step_over() -> dict:
 # MCP tools -- breakpoints
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_offload
 def bp(address: str, once: bool = False) -> dict:
     """
     Set a breakpoint.
@@ -453,7 +637,7 @@ def bp(address: str, once: bool = False) -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def hw_bp(address: str, width: int = 4, access: str = "e") -> dict:
     """
     Set a hardware breakpoint (ba command).
@@ -471,7 +655,7 @@ def hw_bp(address: str, width: int = 4, access: str = "e") -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def list_bps() -> dict:
     """List all breakpoints (bl)."""
     try:
@@ -480,7 +664,7 @@ def list_bps() -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def remove_bp(bp_id: str = "*") -> dict:
     """
     Remove a breakpoint.
@@ -498,7 +682,7 @@ def remove_bp(bp_id: str = "*") -> dict:
 # MCP tools -- inspection
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_offload
 def raw(cmd: str, timeout: int = 20) -> dict:
     """
     Execute any raw kd command and return its output.
@@ -517,7 +701,7 @@ def raw(cmd: str, timeout: int = 20) -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def get_regs() -> dict:
     """Read general-purpose registers at the current break context (r)."""
     try:
@@ -526,7 +710,7 @@ def get_regs() -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def read_mem(address: str, count: int = 16, width: int = 1) -> dict:
     """
     Read memory (db/dw/dd/dq).
@@ -544,7 +728,7 @@ def read_mem(address: str, count: int = 16, width: int = 1) -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def stack_trace(frames: int = 20) -> dict:
     """
     Show the current call stack (k).
@@ -558,7 +742,7 @@ def stack_trace(frames: int = 20) -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def whereami() -> dict:
     """Show current RIP, its nearest symbol, and the top 5 stack frames."""
     try:
@@ -574,22 +758,31 @@ def whereami() -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
-def list_modules(pattern: str = "") -> dict:
+@_offload
+def list_modules(pattern: str = "", reload: bool = False) -> dict:
     """
     List loaded kernel modules (lm).
 
     Args:
-        pattern: Optional name glob, e.g. "mmc*".
+        pattern: Optional name glob, e.g. "mmc*" or "tcpip*".
+        reload:  Run a kernel '.reload' first (default False). Set this if a
+                 driver you expect (e.g. http.sys, tcpip) doesn't show up: after
+                 switching into a user-process context (.process /r) and doing
+                 '.reload /user', lm enumerates that process's USER modules and
+                 the kernel driver list disappears until a kernel '.reload'
+                 rebuilds it. (The trailing "Unable to enumerate user-mode
+                 unloaded modules" line from lm is a benign warning.)
     """
-    cmd = f"lm m {pattern}" if pattern else "lm"
     try:
+        if reload:
+            _cmd(".reload", timeout=60)
+        cmd = f"lm m {pattern}" if pattern else "lm"
         return {"output": _cmd(cmd, timeout=30)}
     except Exception as exc:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def find_symbol(pattern: str) -> dict:
     """
     Resolve symbol pattern to addresses (x command).
@@ -603,7 +796,7 @@ def find_symbol(pattern: str) -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def addr_to_symbol(address: str) -> dict:
     """
     Resolve an address to its nearest symbol (ln).
@@ -617,7 +810,7 @@ def addr_to_symbol(address: str) -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def set_sympath(path: str = "") -> dict:
     """
     Set or show the symbol search path (.sympath).
@@ -633,7 +826,7 @@ def set_sympath(path: str = "") -> dict:
         return {"error": str(exc)}
 
 
-@mcp.tool()
+@_offload
 def reload_symbols(module: str = "") -> dict:
     """
     Reload symbol information (.reload).
