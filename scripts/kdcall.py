@@ -13,8 +13,14 @@ Examples:
   ./kdcall.py 172.16.200.137:8001 raw '{"cmd":"!process 0 0 lsass.exe","timeout":30}'
 """
 import json
+import os
 import sys
 import urllib.request
+
+# Opening a session must outlast a wedged server: a long/blocking command can
+# hold the in-flight request, and a too-short initialize timeout means recovery
+# (e.g. calling reset) dies at session-open. Default 180s; override via env.
+INIT_TIMEOUT = int(os.environ.get("KD_INIT_TIMEOUT", "180"))
 
 HOSTPORT = sys.argv[1] if len(sys.argv) > 1 else "172.16.200.137:8001"
 TOOL = sys.argv[2] if len(sys.argv) > 2 else "status"
@@ -59,7 +65,7 @@ def main():
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                    "clientInfo": {"name": "kdcall", "version": "1.0"}},
-    }, timeout=20)
+    }, timeout=INIT_TIMEOUT)
     post(sid, {"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=10)
     res = parse(post(sid, {
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",

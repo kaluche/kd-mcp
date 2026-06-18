@@ -24,7 +24,7 @@ ACCEPT='application/json, text/event-stream'
 # --- open a session (MCP initialize), retry until we get a session id ----------
 SID=""
 for _ in 1 2 3; do
-  SID=$(curl -s -m 15 -D - -o /dev/null -X POST "$ENDPOINT" \
+  SID=$(curl -s -m 120 -D - -o /dev/null -X POST "$ENDPOINT" \
     -H 'Content-Type: application/json' -H "Accept: $ACCEPT" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"kd-reset","version":"1.0"}}}' \
     | grep -i '^mcp-session-id:' | awk '{print $2}' | tr -d '\r')

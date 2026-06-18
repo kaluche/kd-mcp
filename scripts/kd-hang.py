@@ -19,10 +19,15 @@ Usage:
   ./kd-hang.py [HOST:PORT] [BLOCK_SECONDS] [CONNECT_STRING]
 """
 import json
+import os
 import sys
 import threading
 import time
 import urllib.request
+
+# A patient initialize timeout so a fresh probe session can still be opened
+# while the server is wedged (see Issue 2). Override via env.
+INIT_TIMEOUT = int(os.environ.get("KD_INIT_TIMEOUT", "180"))
 
 HOSTPORT = sys.argv[1] if len(sys.argv) > 1 else "172.16.200.137:8001"
 BLOCK = int(sys.argv[2]) if len(sys.argv) > 2 else 30
@@ -68,7 +73,7 @@ def new_session(name):
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                    "clientInfo": {"name": name, "version": "1.0"}},
-    }, timeout=20)
+    }, timeout=INIT_TIMEOUT)
     post(sid, {"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=10)
     return sid
 

@@ -21,7 +21,7 @@ ACCEPT='application/json, text/event-stream'
 # --- open a session (MCP initialize), retry until we get a session id ----------
 SID=""
 for _ in 1 2 3; do
-  SID=$(curl -s -m 15 -D - -o /dev/null -X POST "$ENDPOINT" \
+  SID=$(curl -s -m 120 -D - -o /dev/null -X POST "$ENDPOINT" \
     -H 'Content-Type: application/json' -H "Accept: $ACCEPT" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"kd-test","version":"1.0"}}}' \
     | grep -i '^mcp-session-id:' | awk '{print $2}' | tr -d '\r')
@@ -82,5 +82,5 @@ call whereami
 echo; echo "### resume (unfreeze the target)"
 # 'g' runs the kernel; with no breakpoint no prompt returns, so a short
 # timeout is expected and means "running", not an error.
-call raw '{"cmd":"g","timeout":4}'
+call go '{"timeout":4}'
 echo "(target resumed)"

@@ -51,6 +51,20 @@ _FATAL_INIT_RE = re.compile(
     r"Kernel debugger failed initialization|HRESULT 0x80004005",
     re.IGNORECASE,
 )
+# KDNET link loss. kd.exe prints these while a command is in flight and the
+# transport to the target dies (e.g. a bulk read over slow KDNET saturates the
+# link). We surface this as a distinct, actionable status instead of a generic
+# pattern-timeout so callers know a reset/resync (or a target reboot) is needed.
+_TRANSPORT_LOST_RE = re.compile(
+    r"Retry sending the same data packet|"
+    r"transport connection between host kernel debugger and target .*? (?:seems|is) lost|"
+    r"\[no_debuggee\]",
+    re.IGNORECASE,
+)
+# Printed by kd.exe after a reset/revert when something host-side keeps sending
+# to the KDNET UDP port (most often a stale kd.exe still bound to it). Used to
+# enrich kernel_attach's failure message.
+_BAD_PACKET_RE = re.compile(r"Bad packet sent from", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Windows Job Object -- guarantees kd.exe children die with this server.
@@ -237,17 +251,33 @@ class KdProcess:
     def is_alive(self) -> bool:
         return self.proc.poll() is None
 
-    def kill(self) -> None:
+    def kill(self, wait: float = 5.0) -> None:
         for fn in (self.proc.stdin.close, self.proc.terminate, self.proc.kill):
             try:
                 fn()
             except Exception:
                 pass
+        # Wait for the OS to actually reap kd.exe. Until it fully exits it keeps
+        # the KDNET UDP port bound; relaunching before then makes the new kd.exe
+        # race the stale one for the KDNET hello -- the target then logs
+        # "Bad packet sent from <host>" and the link never re-establishes
+        # (see kernel_attach / issue: reset+revert recovery).
+        try:
+            self.proc.wait(timeout=wait)
+        except Exception:
+            pass
 
     def drain(self) -> None:
         """Discard any buffered output."""
         with self._lock:
             self._buf = ""
+
+    def read_available(self) -> str:
+        """Atomically take and clear whatever is currently buffered."""
+        with self._lock:
+            data = self._buf
+            self._buf = ""
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +329,70 @@ def _cleanup() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+class KdTransportLost(RuntimeError):
+    """The KDNET link between the debug host and the target dropped."""
+
+
+class KdDesyncError(RuntimeError):
+    """A command timed out and the kd.exe pipe could not be resynced."""
+
+
 def _require() -> KdProcess:
     if STATE.kd is None or not STATE.kd.is_alive():
         raise RuntimeError("Not connected -- call kernel_attach first.")
     return STATE.kd
+
+
+def _transport_lost_msg(out: str) -> str:
+    return (
+        "KDNET transport to the target was lost (kd.exe is retrying packets / the "
+        "target is [no_debuggee]). Bulk reads over KDNET -- whole-module 's'/'uf', "
+        "wide wildcard 'x' -- can saturate the slow link. Narrow the range, or do "
+        "heavy static work offline (Ghidra/IDA) and use KD only for targeted "
+        "bp + reads. If the target is unreachable, call reset; a snapshot revert may "
+        "need a full target reboot to re-arm KDNET.\nLast output:\n" + out[-800:]
+    )
+
+
+def _err(exc: Exception) -> dict:
+    """Map an exception from a kd command into a tool result dict, tagging the
+    recoverable KDNET/pipe failures with a distinct, actionable status."""
+    if isinstance(exc, KdTransportLost):
+        return {"status": "transport_lost", "error": str(exc)}
+    if isinstance(exc, KdDesyncError):
+        return {"status": "desynced", "error": str(exc)}
+    return {"error": str(exc)}
+
+
+def _resync_locked(kd: KdProcess, cmd: str, orig_timeout: float) -> None:
+    """
+    Called with _LOCK held after a prompt timeout. kd.exe is still mid-command
+    and still emitting output; if we simply released the lock, that late output
+    would contaminate the next command's prompt match and the whole session
+    would appear wedged. Interrupt the in-flight command with a break and
+    recover the pipe to a clean prompt. Always raises (never returns normally).
+    """
+    kd.send_break()
+    try:
+        recovered = kd.expect(_PROMPT_RE, timeout=10.0)
+    except TimeoutError:
+        recovered = kd.read_available()
+        if _TRANSPORT_LOST_RE.search(recovered):
+            raise KdTransportLost(_transport_lost_msg(recovered)) from None
+        raise KdDesyncError(
+            f"'{cmd}' did not return within {orig_timeout}s; sent a break but "
+            f"kd.exe never returned to a prompt. The session is desynced or the "
+            f"KDNET link is down -- call reset.\nLast output:\n{recovered[-800:]}"
+        ) from None
+    # kd exited mid-resync -> let RuntimeError from expect propagate as-is.
+    kd.drain()
+    if _TRANSPORT_LOST_RE.search(recovered):
+        raise KdTransportLost(_transport_lost_msg(recovered)) from None
+    raise TimeoutError(
+        f"'{cmd}' exceeded {orig_timeout}s. Interrupted it with a break and "
+        f"resynced the session to a clean prompt; re-run with a larger timeout "
+        f"or a narrower command."
+    )
 
 
 def _cmd(cmd: str, timeout: float = 20.0) -> str:
@@ -311,7 +401,13 @@ def _cmd(cmd: str, timeout: float = 20.0) -> str:
     with _LOCK:
         kd.drain()
         kd.sendline(cmd)
-        raw = kd.expect(_PROMPT_RE, timeout=timeout)
+        try:
+            raw = kd.expect(_PROMPT_RE, timeout=timeout)
+        except TimeoutError:
+            _resync_locked(kd, cmd, timeout)  # always raises
+            raise  # pragma: no cover -- unreachable, keeps type-checkers happy
+    if _TRANSPORT_LOST_RE.search(raw):
+        raise KdTransportLost(_transport_lost_msg(raw))
     # Strip the trailing prompt and leading echo of our command.
     out = _PROMPT_RE.sub("", raw).strip()
     # Remove first line if it looks like the command echo.
@@ -444,7 +540,20 @@ def kernel_attach(
         if STATE.kd is not None:
             STATE.kd.kill()
             STATE.kd = None
-        return {"status": "error", "attempts": attempt, "message": last_error}
+        message = last_error
+        if _BAD_PACKET_RE.search(last_error):
+            # The target is rejecting KDNET packets from the host. Almost always a
+            # stale kd.exe still bound to the KDNET UDP port (so two debuggers race
+            # the hello) or a key/port mismatch after a snapshot revert.
+            message = (
+                "Target reports 'Bad packet sent from <host>' on the KDNET port -- "
+                "the KDNET hello is being rejected. Most likely a stale kd.exe is "
+                "still bound to the KDNET UDP port (kill any leftover kd.exe/windbg "
+                "and retry), or the target's dbgsettings (port/key) no longer match "
+                "after a revert. If it persists, power-cycle the target (a snapshot "
+                "revert alone may not re-arm KDNET).\n" + last_error[-600:]
+            )
+        return {"status": "error", "attempts": attempt, "message": message}
 
 
 @mcp.tool()
@@ -556,6 +665,8 @@ def go(timeout: int = 120) -> dict:
         kd.sendline("g")
         try:
             out = kd.expect(_PROMPT_RE, timeout=float(timeout))
+            if _TRANSPORT_LOST_RE.search(out):
+                return {"status": "transport_lost", "error": _transport_lost_msg(out)}
             return {"status": "break", "output": out.strip()}
         except TimeoutError:
             # No prompt within the window == the target is still running. This
@@ -588,6 +699,8 @@ def break_in(timeout: int = 15) -> dict:
                 "message": "Break signal sent; an in-flight command will return it."}
     try:
         out = kd.expect(_PROMPT_RE, timeout=float(timeout))
+        if _TRANSPORT_LOST_RE.search(out):
+            return {"status": "transport_lost", "error": _transport_lost_msg(out)}
         return {"status": "break", "output": out.strip()}
     except TimeoutError:
         return {"status": "sent", "message": "Break signal sent; no prompt yet."}
@@ -603,7 +716,7 @@ def step_into() -> dict:
     try:
         return {"output": _cmd("t", timeout=10)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -612,7 +725,7 @@ def step_over() -> dict:
     try:
         return {"output": _cmd("p", timeout=10)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +747,7 @@ def bp(address: str, once: bool = False) -> dict:
     try:
         return {"output": _cmd(f"{prefix} {address}") or "(breakpoint set)"}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -652,7 +765,7 @@ def hw_bp(address: str, width: int = 4, access: str = "e") -> dict:
     try:
         return {"output": _cmd(f"ba {access}{width} {address}") or "(hw bp set)"}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -661,7 +774,7 @@ def list_bps() -> dict:
     try:
         return {"output": _cmd("bl")}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -675,7 +788,7 @@ def remove_bp(bp_id: str = "*") -> dict:
     try:
         return {"output": _cmd(f"bc {bp_id}") or "(done)"}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +811,7 @@ def raw(cmd: str, timeout: int = 20) -> dict:
     try:
         return {"output": _cmd(cmd, timeout=float(timeout))}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -707,7 +820,7 @@ def get_regs() -> dict:
     try:
         return {"output": _cmd("r")}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -720,12 +833,26 @@ def read_mem(address: str, count: int = 16, width: int = 1) -> dict:
         count:   Number of units (default 16).
         width:   Unit bytes -- 1=byte, 2=word, 4=dword, 8=qword (default 1).
     """
+    # Guard against link-saturating bulk reads. A single huge read over the slow
+    # KDNET link is many round-trips and has been observed to destabilize/drop
+    # the transport (see issue: whole-module reads). Cap it with an actionable
+    # error rather than firing a read that can take the target offline.
+    _MAX_UNITS = 0x4000
+    if count > _MAX_UNITS:
+        return {
+            "error": (
+                f"count={count:#x} units is too large for a single KDNET read "
+                f"(cap {_MAX_UNITS:#x}). Bulk reads can saturate and drop the KDNET "
+                f"link -- narrow the range, or do bulk extraction offline "
+                f"(Ghidra/IDA) and use KD only for targeted reads."
+            )
+        }
     cmd_map = {1: "db", 2: "dw", 4: "dd", 8: "dq"}
     kd_cmd = f"{cmd_map.get(width, 'db')} {address} L{count:x}"
     try:
         return {"output": _cmd(kd_cmd)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -739,7 +866,7 @@ def stack_trace(frames: int = 20) -> dict:
     try:
         return {"output": _cmd(f"k {frames}")}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -755,7 +882,7 @@ def whereami() -> dict:
             "stack": _cmd("k 5"),
         }
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -779,7 +906,7 @@ def list_modules(pattern: str = "", reload: bool = False) -> dict:
         cmd = f"lm m {pattern}" if pattern else "lm"
         return {"output": _cmd(cmd, timeout=30)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -793,7 +920,7 @@ def find_symbol(pattern: str) -> dict:
     try:
         return {"output": _cmd(f"x {pattern}", timeout=30)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -807,7 +934,7 @@ def addr_to_symbol(address: str) -> dict:
     try:
         return {"output": _cmd(f"ln {address}")}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -823,7 +950,7 @@ def set_sympath(path: str = "") -> dict:
     try:
         return {"output": _cmd(cmd, timeout=60)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 @_offload
@@ -838,7 +965,7 @@ def reload_symbols(module: str = "") -> dict:
     try:
         return {"output": _cmd(cmd, timeout=60)}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _err(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +1016,12 @@ def main() -> None:
             print("Set the KD_EXE environment variable or pass --kd-path to point to kd.exe.", file=sys.stderr)
             sys.exit(1)
 
+    try:
+        from importlib.metadata import version as _pkg_version
+        _ver = _pkg_version("kd-mcp")
+    except Exception:
+        _ver = "unknown"
+
     if args.transport == "streamable-http":
         from mcp.server.transport_security import TransportSecuritySettings
 
@@ -902,10 +1035,10 @@ def main() -> None:
             enable_dns_rebinding_protection=False
         )
         endpoint = f"http://{args.host}:{args.port}{mcp.settings.streamable_http_path}"
-        print(f"kd MCP server starting (streamable-http) on {endpoint}", file=sys.stderr)
+        print(f"kd MCP server v{_ver} starting (streamable-http) on {endpoint}", file=sys.stderr)
         mcp.run(transport="streamable-http")
     else:
-        print("kd MCP server starting (stdio)...", file=sys.stderr)
+        print(f"kd MCP server v{_ver} starting (stdio)...", file=sys.stderr)
         mcp.run()
 
 
