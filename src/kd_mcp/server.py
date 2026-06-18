@@ -287,6 +287,10 @@ class KdProcess:
 class _State:
     kd: Optional[KdProcess] = None
     last_connect_string: str = ""
+    state: str = "disconnected"
+    last_error: str = ""
+    last_output_tail: str = ""
+    last_pid: Optional[int] = None
 
 STATE = _State()
 mcp = FastMCP("kd")
@@ -354,12 +358,51 @@ def _transport_lost_msg(out: str) -> str:
     )
 
 
+def _command_risk(cmd: str) -> Optional[str]:
+    """Return a refusal reason for commands known to desync KDNET sessions."""
+    stripped = cmd.strip()
+    lowered = stripped.lower()
+    if re.search(r"^s\s+-(?:d|q|b|w)\b", lowered):
+        return (
+            "whole-range kd memory searches are high risk over KDNET; use read_mem "
+            "on a bounded range or run the search offline"
+        )
+    if re.search(r"^uf\b", lowered):
+        return (
+            "uf can emit very large disassemblies and desync KDNET; use bounded "
+            "u <addr> L<count> chunks instead"
+        )
+    if re.search(r"^x\s+\S*\*", stripped, re.IGNORECASE):
+        return (
+            "wildcard symbol expansion can produce very large output; query a "
+            "single symbol or a narrower prefix"
+        )
+    if lowered.startswith(".reload /f"):
+        return (
+            "forced symbol reloads can stall the KDNET session; prefer a plain "
+            ".reload or attach with a longer timeout"
+        )
+    return None
+
+
+def _guard_command(cmd: str, allow_dangerous: bool = False) -> None:
+    reason = _command_risk(cmd)
+    if reason and not allow_dangerous:
+        raise ValueError(
+            f"Refusing risky kd command {cmd!r}: {reason}. "
+            "Pass allow_dangerous=true to run it anyway."
+        )
+
+
 def _err(exc: Exception) -> dict:
     """Map an exception from a kd command into a tool result dict, tagging the
     recoverable KDNET/pipe failures with a distinct, actionable status."""
+    STATE.last_error = str(exc)
     if isinstance(exc, KdTransportLost):
+        STATE.state = "transport_lost"
         return {"status": "transport_lost", "error": str(exc)}
     if isinstance(exc, KdDesyncError):
+        STATE.state = "desynced"
         return {"status": "desynced", "error": str(exc)}
     return {"error": str(exc)}
 
@@ -369,24 +412,31 @@ def _resync_locked(kd: KdProcess, cmd: str, orig_timeout: float) -> None:
     Called with _LOCK held after a prompt timeout. kd.exe is still mid-command
     and still emitting output; if we simply released the lock, that late output
     would contaminate the next command's prompt match and the whole session
-    would appear wedged. Interrupt the in-flight command with a break and
-    recover the pipe to a clean prompt. Always raises (never returns normally).
+    would be desynced. Send a break, wait a short bounded interval, and either
+    recover the pipe to a clean prompt or report a real desync. Always raises.
     """
     kd.send_break()
     try:
         recovered = kd.expect(_PROMPT_RE, timeout=10.0)
     except TimeoutError:
         recovered = kd.read_available()
+        STATE.last_output_tail = recovered[-800:]
         if _TRANSPORT_LOST_RE.search(recovered):
+            STATE.state = "transport_lost"
             raise KdTransportLost(_transport_lost_msg(recovered)) from None
+        STATE.state = "desynced"
         raise KdDesyncError(
             f"'{cmd}' did not return within {orig_timeout}s; sent a break but "
             f"kd.exe never returned to a prompt. The session is desynced or the "
             f"KDNET link is down -- call reset.\nLast output:\n{recovered[-800:]}"
         ) from None
+
     # kd exited mid-resync -> let RuntimeError from expect propagate as-is.
     kd.drain()
+    STATE.state = "connected"
+    STATE.last_output_tail = recovered[-800:]
     if _TRANSPORT_LOST_RE.search(recovered):
+        STATE.state = "transport_lost"
         raise KdTransportLost(_transport_lost_msg(recovered)) from None
     raise TimeoutError(
         f"'{cmd}' exceeded {orig_timeout}s. Interrupted it with a break and "
@@ -395,8 +445,9 @@ def _resync_locked(kd: KdProcess, cmd: str, orig_timeout: float) -> None:
     )
 
 
-def _cmd(cmd: str, timeout: float = 20.0) -> str:
+def _cmd(cmd: str, timeout: float = 20.0, allow_dangerous: bool = False) -> str:
     """Send a command, wait for the next kd> prompt, return output (prompt stripped)."""
+    _guard_command(cmd, allow_dangerous=allow_dangerous)
     kd = _require()
     with _LOCK:
         kd.drain()
@@ -406,8 +457,12 @@ def _cmd(cmd: str, timeout: float = 20.0) -> str:
         except TimeoutError:
             _resync_locked(kd, cmd, timeout)  # always raises
             raise  # pragma: no cover -- unreachable, keeps type-checkers happy
+    STATE.last_output_tail = raw[-800:]
     if _TRANSPORT_LOST_RE.search(raw):
+        STATE.state = "transport_lost"
         raise KdTransportLost(_transport_lost_msg(raw))
+    STATE.state = "connected"
+    STATE.last_error = ""
     # Strip the trailing prompt and leading echo of our command.
     out = _PROMPT_RE.sub("", raw).strip()
     # Remove first line if it looks like the command echo.
@@ -443,26 +498,32 @@ def kernel_attach(
     Returns: {status, kernel_version, attempts, output} or {status, message}
     """
     with _LOCK:
-        # Kill any previous session. Clear breakpoints first (so no int 3 is
-        # left in user code -- see detach), then qd (quit + detach) so the
-        # previous target is left running rather than stranded halted.
         if STATE.kd and STATE.kd.is_alive():
             try:
+                # qd = quit and detach, leaves the target running.  Clear breakpoints
+                # first so we don't strand int3s in guest code.
                 STATE.kd.sendline("bc *")
                 time.sleep(0.2)
                 STATE.kd.sendline("qd")
                 time.sleep(0.4)
             except Exception:
                 pass
+            old_pid = STATE.kd.proc.pid
             STATE.kd.kill()
-        STATE.kd = None
+            STATE.last_pid = old_pid
 
         args = [KD_EXE, "-k", connect_string]
-
         try:
             STATE.kd = KdProcess(args)
         except OSError as exc:
+            STATE.state = "disconnected"
+            STATE.last_error = str(exc)
             return {"status": "error", "message": f"Failed to launch kd.exe: {exc}"}
+
+        STATE.state = "attaching"
+        STATE.last_error = ""
+        STATE.last_output_tail = ""
+        STATE.last_pid = STATE.kd.proc.pid
 
         if reset_vm:
             subprocess.Popen(
@@ -483,30 +544,75 @@ def kernel_attach(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+
             try:
-                # Phase 1: wait for TCP connect OR full KD handshake.
-                # On a running system kd.exe fires "Connected to target" first;
-                # the kernel won't complete the KD handshake until we break in.
-                # On a boot-break system the full handshake arrives on its own.
+                # Phase 1: wait for TCP connect OR KD handshake. kd.exe fires
+                # "Connected to target" first; boot-time KDNET can then take a
+                # long time to finish initial symbol / target validation.
                 out = STATE.kd.expect(_ANY_CONNECTED_RE, timeout=remaining)
-                # Phase 2: send break always.  Harmless if the kernel is already
-                # halted (boot break); required to trigger the KD handshake on a
-                # running system.
-                STATE.kd.send_break()
-                out += STATE.kd.expect(_PROMPT_RE, timeout=60)
-                ver = re.search(r"Windows \S+ \d+ \S+ x64", out)
+                STATE.last_output_tail = out[-800:]
+
+                # We have a live KDNET association. From this point onward, do not
+                # kill kd.exe merely because prompt validation takes too long; doing
+                # so can leave the target rejecting later attach attempts until reboot.
+                prompt_timeout = min(60.0, max(deadline - time.monotonic(), 1.0))
+                try:
+                    STATE.kd.send_break()
+                    out += STATE.kd.expect(_PROMPT_RE, timeout=prompt_timeout)
+                except TimeoutError:
+                    out += STATE.kd.read_available()
+                    STATE.state = "connected"
+                    STATE.last_connect_string = connect_string
+                    STATE.last_pid = STATE.kd.proc.pid
+                    STATE.last_output_tail = out[-800:]
+                    ver = re.search(r"Windows .*? Kernel Version .*", out)
+                    return {
+                        "status": "connected",
+                        "validation": "prompt_timeout",
+                        "attempts": attempt,
+                        "pid": STATE.kd.proc.pid,
+                        "kernel_version": ver.group(0) if ver else "unknown",
+                        "message": (
+                            "KDNET reported an established debugger connection, but kd.exe "
+                            "did not return to a prompt before the validation timeout. The "
+                            "existing kd.exe was kept alive; retry with a longer timeout or "
+                            "use break_in/status rather than reset/kernel_attach."
+                        ),
+                        "output": out[-600:].strip(),
+                    }
+
+                if _TRANSPORT_LOST_RE.search(out):
+                    STATE.state = "transport_lost"
+                    STATE.last_error = _transport_lost_msg(out)
+                    return {
+                        "status": "transport_lost",
+                        "attempts": attempt,
+                        "pid": STATE.kd.proc.pid,
+                        "error": STATE.last_error,
+                    }
+
+                ver = re.search(r"Windows .*? Kernel Version .*", out)
                 STATE.last_connect_string = connect_string
+                STATE.state = "connected"
+                STATE.last_error = ""
+                STATE.last_pid = STATE.kd.proc.pid
+                STATE.last_output_tail = out[-800:]
                 return {
                     "status": "connected",
                     "attempts": attempt,
+                    "pid": STATE.kd.proc.pid,
                     "kernel_version": ver.group(0) if ver else "unknown",
                     "output": out[-600:].strip(),
                 }
+
             except RuntimeError as exc:
-                # kd.exe exited (connection refused, wrong key, etc.) -- respawn and retry
+                # kd.exe exited (connection refused, wrong key, etc.) -- respawn and retry.
                 last_error = str(exc)
-                STATE.kd.kill()
+                STATE.last_error = last_error
+                if STATE.kd:
+                    STATE.kd.kill()
                 STATE.kd = None
+                STATE.state = "disconnected"
                 if _FATAL_INIT_RE.search(last_error):
                     # Permanent failure -- respawning will only spin and can destabilize
                     # the server. Stop now with an actionable message.
@@ -514,37 +620,37 @@ def kernel_attach(
                         "status": "error",
                         "attempts": attempt,
                         "message": (
-                            "kd.exe could not initialize, and retrying will not help. "
-                            "Most often the KDNET port is already in use by another "
-                            "debugger (close any windbg.exe/kd.exe holding it), or the "
-                            "connection key is wrong.\n" + last_error[-600:]
+                            "kd.exe failed before attaching; this is usually another "
+                            "kd.exe/windbg still holding the KDNET UDP port, a bad "
+                            "connect string, or a target that needs a full reboot.\n" +
+                            last_error[-600:]
                         ),
                     }
-                remaining = deadline - time.monotonic()
-                if remaining <= 1:
-                    break
-                time.sleep(1)
-                try:
-                    STATE.kd = KdProcess(args)
-                except OSError as oserr:
-                    STATE.kd = None
-                    return {"status": "error", "message": f"Failed to launch kd.exe: {oserr}"}
             except TimeoutError as exc:
-                # Full timeout elapsed in a single attempt -- no point retrying
                 last_error = str(exc)
-                STATE.kd.kill()
+                STATE.last_error = last_error
+                if STATE.kd:
+                    STATE.kd.kill()
                 STATE.kd = None
-                break
+                STATE.state = "disconnected"
 
-        # Ensure STATE is clean so subsequent calls get a clear "not connected" error
-        if STATE.kd is not None:
-            STATE.kd.kill()
-            STATE.kd = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(2.0, max(0.1, remaining / 10)))
+            try:
+                STATE.kd = KdProcess(args)
+                STATE.state = "attaching"
+                STATE.last_pid = STATE.kd.proc.pid
+            except OSError as exc:
+                last_error = str(exc)
+                STATE.last_error = last_error
+                time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+
+        STATE.state = "disconnected"
+        STATE.last_error = last_error
         message = last_error
         if _BAD_PACKET_RE.search(last_error):
-            # The target is rejecting KDNET packets from the host. Almost always a
-            # stale kd.exe still bound to the KDNET UDP port (so two debuggers race
-            # the hello) or a key/port mismatch after a snapshot revert.
             message = (
                 "Target reports 'Bad packet sent from <host>' on the KDNET port -- "
                 "the KDNET hello is being rejected. Most likely a stale kd.exe is "
@@ -558,10 +664,27 @@ def kernel_attach(
 
 @mcp.tool()
 def status() -> dict:
-    """Return current debugger connection state."""
-    if STATE.kd is None or not STATE.kd.is_alive():
-        return {"connected": False}
-    return {"connected": True, "pid": STATE.kd.proc.pid}
+    """Return current debugger connection state without touching kd.exe stdin/stdout."""
+    kd = STATE.kd
+    alive = kd is not None and kd.is_alive()
+    if not alive:
+        if STATE.state not in ("transport_lost", "desynced"):
+            STATE.state = "disconnected"
+        return {
+            "connected": False,
+            "state": STATE.state,
+            "last_pid": STATE.last_pid,
+            "last_error": STATE.last_error,
+            "last_output_tail": STATE.last_output_tail,
+        }
+    return {
+        "connected": True,
+        "state": STATE.state or "connected",
+        "pid": kd.proc.pid,
+        "last_connect_string": STATE.last_connect_string,
+        "last_error": STATE.last_error,
+        "last_output_tail": STATE.last_output_tail,
+    }
 
 
 @_offload
@@ -588,59 +711,66 @@ def detach() -> dict:
                 time.sleep(0.4)
             except Exception:
                 pass
+            STATE.last_pid = STATE.kd.proc.pid
             STATE.kd.kill()
-        STATE.kd = None
-    return {"status": "disconnected"}
+            STATE.kd = None
+            STATE.state = "disconnected"
+        return {"status": "disconnected"}
 
 
 @_offload
 def reset(connect_string: str = "", reconnect: bool = True, timeout: int = 90) -> dict:
     """
-    Force-kill the current kd.exe and (optionally) reconnect.
+    Force-kill the current kd.exe and optionally reconnect.
 
-    Use this when the debugger is wedged or unresponsive (commands time out and
-    break_in does not recover it). Unlike detach, this does not try a graceful
-    "q" first -- it terminates kd.exe immediately, then re-attaches.
+    This deliberately does not take _LOCK before killing: a wedged command may be
+    holding it. Dropping STATE.kd and killing the process makes that command's
+    expect() see a dead process and release the lock; reconnect then happens
+    normally.
 
     Args:
-        connect_string: KDNET string to reconnect with. If omitted, the last
-                        successful connect_string is reused.
-        reconnect:      Re-attach after killing (default True). Set False to just
-                        tear the session down.
+        connect_string: KDNET string. Empty = reuse last successful connect string.
+        reconnect:      Reconnect after killing (default True). Set False to just
+                        tear down the current kd.exe.
         timeout:        Seconds to keep trying for the reconnection (default 90).
 
     Returns: kernel_attach's result when reconnecting, else {status}.
     """
-    # Deliberately do NOT take _LOCK before killing: a wedged command may be
-    # holding it inside expect(), and the whole point of reset is to recover
-    # from that. Dropping STATE.kd and killing the process makes that command's
-    # expect() see a dead process and raise, which releases the lock; the
-    # reconnect below (kernel_attach) then acquires it normally.
     old = STATE.kd
+    old_pid = old.proc.pid if old else None
     STATE.kd = None
+    STATE.state = "resetting"
     if old:
         try:
-            # Best-effort breakpoint clear so a hard reset doesn't strand an
-            # int 3 in user code (e.g. lsass -> CRITICAL_PROCESS_DIED). No-ops
-            # if kd is truly wedged; we kill regardless.
+            # Best-effort breakpoint clear so a hard reset doesn't strand an int3
+            # in guest code (e.g. lsass -> CRITICAL_PROCESS_DIED). No-ops if kd
+            # is truly wedged; we kill regardless.
             old.sendline("bc *")
             time.sleep(0.2)
         except Exception:
             pass
         old.kill()
+        STATE.last_pid = old_pid
 
     if not reconnect:
-        return {"status": "killed"}
+        STATE.state = "disconnected"
+        return {"status": "killed", "killed_pid": old_pid}
 
     cs = connect_string or STATE.last_connect_string
     if not cs:
+        STATE.state = "disconnected"
         return {
             "status": "killed",
+            "killed_pid": old_pid,
             "message": "No connect_string to reconnect with; pass one or call kernel_attach.",
         }
-    # kernel_attach is now an async MCP wrapper; call the underlying sync
-    # implementation (set by functools.wraps) so we stay synchronous.
-    return kernel_attach.__wrapped__(connect_string=cs, timeout=timeout)
+
+    # kernel_attach is the async MCP wrapper; call the sync function underneath.
+    result = kernel_attach.__wrapped__(connect_string=cs, timeout=timeout)
+    if isinstance(result, dict):
+        result.setdefault("killed_pid", old_pid)
+        result.setdefault("reconnect", True)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +926,7 @@ def remove_bp(bp_id: str = "*") -> dict:
 # ---------------------------------------------------------------------------
 
 @_offload
-def raw(cmd: str, timeout: int = 20) -> dict:
+def raw(cmd: str, timeout: int = 20, allow_dangerous: bool = False) -> dict:
     """
     Execute any raw kd command and return its output.
 
@@ -809,7 +939,7 @@ def raw(cmd: str, timeout: int = 20) -> dict:
         timeout: Seconds to wait for the prompt (default 20).
     """
     try:
-        return {"output": _cmd(cmd, timeout=float(timeout))}
+        return {"output": _cmd(cmd, timeout=float(timeout), allow_dangerous=allow_dangerous)}
     except Exception as exc:
         return _err(exc)
 
@@ -910,7 +1040,7 @@ def list_modules(pattern: str = "", reload: bool = False) -> dict:
 
 
 @_offload
-def find_symbol(pattern: str) -> dict:
+def find_symbol(pattern: str, allow_dangerous: bool = False) -> dict:
     """
     Resolve symbol pattern to addresses (x command).
 
@@ -918,7 +1048,7 @@ def find_symbol(pattern: str) -> dict:
         pattern: Symbol glob, e.g. "nt!NtCreate*" or "mmc!ScOnOpen*".
     """
     try:
-        return {"output": _cmd(f"x {pattern}", timeout=30)}
+        return {"output": _cmd(f"x {pattern}", timeout=30, allow_dangerous=allow_dangerous)}
     except Exception as exc:
         return _err(exc)
 

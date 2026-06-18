@@ -137,10 +137,10 @@ pip install -e .
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `kernel_attach` | `connect_string`, `reset_vm?`, `timeout` | `{status, kernel_version, attempts, output}` |
-| `status` | — | `{connected, pid?}` |
+| `kernel_attach` | `connect_string`, `reset_vm?`, `timeout` | `{status, kernel_version, attempts, pid?, output, validation?}` |
+| `status` | — | `{connected, state, pid?, last_pid?, last_error?, last_output_tail?}` |
 | `detach` | — | `{status}` |
-| `reset` | `connect_string?`, `reconnect`, `timeout` | `{status, ...}` |
+| `reset` | `connect_string?`, `reconnect`, `timeout` | `{status, killed_pid?, reconnect?, ...}` |
 
 **`reset`** — Force-kills the current kd.exe and (optionally) re-attaches. Use it when
 the debugger is wedged and `break_in`/`detach` won't recover it. Unlike `detach` it does
@@ -184,18 +184,20 @@ Hyper-V VM name to hard-reset the VM 2 seconds after kd.exe starts.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `raw` | `cmd`, `timeout` | `{output}` |
+| `raw` | `cmd`, `timeout`, `allow_dangerous?` | `{output}` |
 | `get_regs` | — | `{output}` |
 | `read_mem` | `address`, `count`, `width` | `{output}` |
 | `stack_trace` | `frames` | `{output}` |
 | `whereami` | — | `{rip, symbol, stack}` |
 | `list_modules` | `pattern?` | `{output}` |
-| `find_symbol` | `pattern` | `{output}` |
+| `find_symbol` | `pattern`, `allow_dangerous?` | `{output}` |
 | `addr_to_symbol` | `address` | `{output}` |
 | `set_sympath` | `path?` | `{output}` |
 | `reload_symbols` | `module?` | `{output}` |
 
-`raw` executes any kd command directly: `"!process 0 0"`, `"dt nt!_EPROCESS @$proc"`, etc.
+`raw` executes kd commands directly: `"!process 0 0"`, `"dt nt!_EPROCESS @$proc"`, etc.
+Commands known to desync KDNET (`uf`, whole-range `s`, wide wildcard `x`,
+forced `.reload /f`) are refused unless `allow_dangerous=true`.
 
 `read_mem` `width` values: `1` = byte (db), `2` = word (dw), `4` = dword (dd), `8` = qword (dq).
 
@@ -252,6 +254,13 @@ return `{"status": "transport_lost", ...}` instead of a generic timeout. Mitigat
 KD reads narrow and targeted; do heavy static analysis offline (Ghidra/IDA) and use KD
 only for breakpoints and small reads. `read_mem` rejects single reads above `0x4000`
 units for this reason.
+
+**`kernel_attach` returns `validation: "prompt_timeout"`.** KDNET reported an
+established debugger connection, but kd.exe did not return to a prompt before
+validation finished. kd-mcp keeps that kd.exe alive and returns a connected
+status because killing it at this point can make later attaches fail until
+the target is rebooted. Retry with a longer `timeout` or use `status`/`break_in`
+rather than immediately calling `reset` or another `kernel_attach`.
 
 **`Bad packet sent from <host>` after a reset/revert.** The target is rejecting the KDNET
 hello. Most often a stale kd.exe is still bound to the KDNET UDP port (so two debuggers
